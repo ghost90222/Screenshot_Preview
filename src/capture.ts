@@ -25,7 +25,45 @@ async function runFlow(path: string, udid: string) {
   return argent.flow(path, udid);
 }
 
-/** What `frame`/`preview` read. Written to out/raw/<device>/manifest.json. */
+/**
+ * Whether a device captures every locale separately: `localizedCaptures` is
+ * on and the device's locale can be pinned (iOS simulators; android emulators
+ * are not locale-pinned, see device.prepare).
+ */
+export function capturesPerLocale(
+  cfg: Pick<LoadedConfig, "localizedCaptures">,
+  deviceKey: DeviceKey,
+): boolean {
+  return Boolean(cfg.localizedCaptures) && DEVICES[deviceKey].platform === "ios";
+}
+
+/**
+ * The raw captures a device renders a locale from: out/raw/<device>/<locale>/
+ * when the device captures per locale, else the one shared out/raw/<device>/.
+ */
+export function rawDirFor(
+  cfg: Pick<LoadedConfig, "localizedCaptures" | "outDir">,
+  deviceKey: DeviceKey,
+  locale: string,
+): string {
+  const shared = join(cfg.outDir, "raw", deviceKey);
+  return capturesPerLocale(cfg, deviceKey) ? join(shared, locale) : shared;
+}
+
+/**
+ * The locales a capture run replays the flows in: every requested locale when
+ * the device captures per locale, else just the first configured one, whose
+ * captures every locale shares.
+ */
+export function captureLocales(
+  cfg: Pick<LoadedConfig, "localizedCaptures" | "locales">,
+  deviceKey: DeviceKey,
+  requested: string[] = cfg.locales,
+): string[] {
+  return capturesPerLocale(cfg, deviceKey) ? requested : [cfg.locales[0]!];
+}
+
+/** What `frame`/`preview` read. Written to the capture dir (rawDirFor) as manifest.json. */
 export type CaptureManifest = {
   device: DeviceKey;
   udid: string;
@@ -37,15 +75,19 @@ export type CaptureManifest = {
   } | null;
 };
 
-export async function capture(cfg: LoadedConfig, deviceKey: DeviceKey): Promise<CaptureManifest> {
+export async function capture(
+  cfg: LoadedConfig,
+  deviceKey: DeviceKey,
+  locale: string = cfg.locales[0]!,
+): Promise<CaptureManifest> {
   const spec = DEVICES[deviceKey];
   const udid = await device.resolveUdid(deviceKey);
-  const rawDir = join(cfg.outDir, "raw", deviceKey);
+  const rawDir = rawDirFor(cfg, deviceKey, locale);
   await mkdir(rawDir, { recursive: true });
 
   const app = appFor(cfg, deviceKey);
-  console.log(`> ${spec.simulatorName ?? spec.label} (${udid})`);
-  await device.prepare(deviceKey, udid, cfg.locales[0]!, cfg.appearance);
+  console.log(`> ${spec.simulatorName ?? spec.label} (${udid}), ${locale}`);
+  await device.prepare(deviceKey, udid, locale, cfg.appearance);
   // A reinstall wipes app data, which is what makes a re-capture deterministic:
   // flows that create records start from the same empty state every run.
   await device.installApp(udid, app.path, app.id);
@@ -72,8 +114,8 @@ export async function capture(cfg: LoadedConfig, deviceKey: DeviceKey): Promise<
     // screenshot taken in that window catches a half-applied status bar - two
     // otherwise identical runs then differ by the wifi glyph alone.
     // Pinned twice with a settle between: the runner restores the status bar it
-    // pinned for the run, and that restore can land after `argent flow run` has
-    // already exited. A single pin loses that race often enough that two
+    // pinned for the run, and that restore can land after the flow run has
+    // already returned. A single pin loses that race often enough that two
     // otherwise identical runs differ by the wifi and battery glyphs alone.
     await device.pinStatusBar(deviceKey, udid);
     await sleep(800);
@@ -164,8 +206,7 @@ async function captureSegments(
       if (segment.holdSeconds) await sleep(segment.holdSeconds * 1000);
     } finally {
       // Stop even on failure, or the next segment cannot start a recording.
-      // `--out` only handles image results, so the mp4 is copied off the path
-      // the tool materialized it to.
+      // The mp4 is copied off the local path the client materialized it to.
       // Release even if the stop throws: a live re-pin loop keeps the process
       // from exiting, so a failed capture would hang instead of reporting.
       try {
